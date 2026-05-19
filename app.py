@@ -10,9 +10,25 @@ import uuid
 
 from flask import Flask, jsonify, render_template, request
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOADS_DIR = os.path.join(APP_DIR, "downloads")
-CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+def _resource_dir():
+    """Where Flask reads templates/static from (read-only when frozen)."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _data_dir():
+    """Where downloads + config live (read-write, persistent next to the exe)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+RESOURCE_DIR = _resource_dir()
+DATA_DIR = _data_dir()
+APP_DIR = DATA_DIR  # back-compat alias for any external references
+DOWNLOADS_DIR = os.path.join(DATA_DIR, "downloads")
+CONFIG_FILE = os.path.join(DATA_DIR, "config.json")
 
 
 def load_user_config():
@@ -32,9 +48,14 @@ def save_user_config(cfg):
 
 
 def initial_out_dir():
-    saved = (load_user_config().get("out_dir") or "").strip()
+    cfg = load_user_config()
+    saved = (cfg.get("out_dir") or "").strip()
     if saved:
-        path = os.path.expanduser(saved)
+        path = os.path.normpath(os.path.expanduser(saved))
+        # Self-heal: rewrite config.json if the on-disk value had mixed/forward slashes.
+        if path != saved:
+            cfg["out_dir"] = path
+            save_user_config(cfg)
         try:
             os.makedirs(path, exist_ok=True)
             return path
@@ -42,15 +63,70 @@ def initial_out_dir():
             pass
     env = os.environ.get("TAPEDECK_OUT_DIR")
     if env:
-        return os.path.expanduser(env)
-    return os.path.expanduser("~/Music/yt")
+        return os.path.normpath(os.path.expanduser(env))
+    return os.path.normpath(os.path.expanduser("~/Music/yt"))
+
+
+DEFAULT_TEMPLATE = "{title}"
+
+
+def initial_filename_template():
+    return (load_user_config().get("filename_template") or "").strip() or DEFAULT_TEMPLATE
+
+
+class JobCancelled(Exception):
+    pass
+
+
+# Friendly translations for common yt-dlp / network errors. First regex match wins;
+# fallback is the raw first line, trimmed.
+_ERROR_PATTERNS = [
+    (re.compile(r"video unavailable", re.I),
+     "Video unavailable — it may be private, deleted, or region-locked."),
+    (re.compile(r"sign in to confirm your age", re.I),
+     "Age-restricted video. Sign-in required."),
+    (re.compile(r"private video", re.I), "Private video."),
+    (re.compile(r"members[- ]only", re.I), "Members-only content."),
+    (re.compile(r"HTTP Error 429|too many requests", re.I),
+     "YouTube rate-limited the request. Wait a moment and retry."),
+    (re.compile(r"HTTP Error 403|access denied", re.I),
+     "Access forbidden by the host."),
+    (re.compile(r"HTTP Error 404|not found", re.I), "URL not found."),
+    (re.compile(r"unable to download webpage|name or service not known|getaddrinfo failed",
+                re.I),
+     "Network error — can't reach the host."),
+    (re.compile(r"unsupported url", re.I),
+     "Unsupported URL — yt-dlp doesn't recognize this site."),
+    (re.compile(r"is not a valid url|not a valid url", re.I),
+     "That doesn't look like a valid URL."),
+    (re.compile(r"ffmpeg", re.I),
+     "FFmpeg error during conversion. Make sure FFmpeg is installed."),
+]
+
+
+def friendlyize_error(exc) -> str:
+    msg = str(exc).strip()
+    if not msg:
+        return "Unknown error."
+    for pat, friendly in _ERROR_PATTERNS:
+        if pat.search(msg):
+            return friendly
+    first = msg.splitlines()[0]
+    # yt-dlp prefixes errors with "ERROR: " — strip that for a cleaner display.
+    first = re.sub(r"^(ERROR|WARNING):\s*", "", first, flags=re.I)
+    return first[:220]
 
 
 OUT_DIR = initial_out_dir()
+FILENAME_TEMPLATE = initial_filename_template()
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
 
-app = Flask(__name__)
+app = Flask(
+    __name__,
+    template_folder=os.path.join(RESOURCE_DIR, "templates"),
+    static_folder=os.path.join(RESOURCE_DIR, "static"),
+)
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -113,16 +189,36 @@ def safe_name(s: str) -> str:
 
 
 def short_path(p: str) -> str:
-    home = os.path.expanduser("~")
-    norm = p.replace("\\", "/")
-    home_norm = home.replace("\\", "/")
-    if norm.lower().startswith(home_norm.lower()):
-        return "~" + norm[len(home_norm):]
-    return norm
+    p_norm = os.path.normpath(p)
+    home_norm = os.path.normpath(os.path.expanduser("~"))
+    if p_norm.lower().startswith(home_norm.lower()):
+        return "~" + p_norm[len(home_norm):]
+    return p_norm
 
 
-def move_to_output(staged_path: str, title: str, fmt: str) -> str:
-    base = safe_name(title)
+_TOKEN_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+
+def render_filename(template: str, info: dict) -> str:
+    """Substitute {token} placeholders with sanitized info values.
+
+    Unknown tokens stay as literals so typos are visible in the filename
+    rather than silently dropped. Falls back to the title (or 'audio') if
+    the rendered string is empty after substitution and trimming.
+    """
+    def repl(m):
+        val = info.get(m.group(1))
+        return safe_name(str(val)) if val is not None else m.group(0)
+
+    rendered = _TOKEN_RE.sub(repl, template or DEFAULT_TEMPLATE)
+    rendered = re.sub(r"\s+", " ", rendered).strip()
+    if not rendered:
+        rendered = safe_name(info.get("title") or "audio")
+    return rendered[:160]
+
+
+def move_to_output(staged_path: str, info: dict, fmt: str, template: str = None) -> str:
+    base = render_filename(template or FILENAME_TEMPLATE, info)
     candidate = os.path.join(OUT_DIR, f"{base}.{fmt}")
     n = 1
     while os.path.exists(candidate):
@@ -130,6 +226,21 @@ def move_to_output(staged_path: str, title: str, fmt: str) -> str:
         n += 1
     shutil.move(staged_path, candidate)
     return candidate
+
+
+def cleanup_staging_for_job(job_id: str):
+    """Remove every file in the staging dir whose name starts with the job_id —
+    handles `.webm`, `.m4a`, `.mp3`, `.jpg` thumbnails, partials, etc."""
+    prefix = job_id + "."
+    try:
+        for name in os.listdir(DOWNLOADS_DIR):
+            if name.startswith(prefix):
+                try:
+                    os.unlink(os.path.join(DOWNLOADS_DIR, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
 
 
 def reveal(path: str, select: bool = False):
@@ -145,8 +256,16 @@ def reveal(path: str, select: bool = False):
             ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
         except Exception:
             pass
-        arg = f"/select,{path}" if select else path
-        subprocess.Popen(["explorer", arg])
+        norm = os.path.normpath(path)
+        if select:
+            # Explorer's /select arg parser expects `/select,"<path>"` — quotes
+            # around the path only. subprocess.list2cmdline would instead wrap
+            # the whole `/select,<path>` token in quotes when the path contains
+            # spaces, which Explorer mis-parses and silently opens Documents
+            # instead. Build the command line manually so the quoting is right.
+            subprocess.Popen(f'explorer /select,"{norm}"')
+        else:
+            subprocess.Popen(["explorer", norm])
     elif plat == "darwin":
         if select:
             subprocess.Popen(["open", "-R", path])
@@ -169,6 +288,17 @@ def fmt_duration(seconds: int) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def _cancel_event_for(job_id: str):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        return job.get("cancel_event") if job else None
+
+
+# Formats whose container supports embedded cover art via FFmpeg.
+# wav has no standard cover-art slot, so EmbedThumbnail is skipped there.
+_THUMBNAIL_FORMATS = {"mp3", "m4a", "opus", "flac"}
+
+
 def run_yt_dlp(job_id: str, url: str, quality: str = "320", fmt: str = "mp3"):
     from yt_dlp import YoutubeDL
 
@@ -177,8 +307,11 @@ def run_yt_dlp(job_id: str, url: str, quality: str = "320", fmt: str = "mp3"):
 
     ffmpeg_dir = find_ffmpeg_dir()
     outtmpl = os.path.join(DOWNLOADS_DIR, f"{job_id}.%(ext)s")
+    cancel_event = _cancel_event_for(job_id)
 
     def progress_hook(d):
+        if cancel_event and cancel_event.is_set():
+            raise JobCancelled()
         status = d.get("status")
         if status == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
@@ -188,18 +321,29 @@ def run_yt_dlp(job_id: str, url: str, quality: str = "320", fmt: str = "mp3"):
         elif status == "finished":
             update_job(job_id, phase="converting", progress=96)
 
+    postprocessors = [{
+        "key": "FFmpegExtractAudio",
+        "preferredcodec": fmt,
+        "preferredquality": quality,
+    }, {
+        # Writes title/artist/album/etc. into the container's metadata block.
+        "key": "FFmpegMetadata",
+        "add_metadata": True,
+    }]
+    if fmt in _THUMBNAIL_FORMATS:
+        # EmbedThumbnail must come after the audio extraction; yt-dlp orders
+        # postprocessors in the list order we provide.
+        postprocessors.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
+
     opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "writethumbnail": fmt in _THUMBNAIL_FORMATS,
         "progress_hooks": [progress_hook],
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": fmt,
-            "preferredquality": quality,
-        }],
+        "postprocessors": postprocessors,
     }
     if ffmpeg_dir:
         opts["ffmpeg_location"] = ffmpeg_dir
@@ -209,13 +353,12 @@ def run_yt_dlp(job_id: str, url: str, quality: str = "320", fmt: str = "mp3"):
 
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        title = info.get("title", "audio")
 
     staged_path = os.path.join(DOWNLOADS_DIR, f"{job_id}.{fmt}")
     if not os.path.exists(staged_path):
         raise RuntimeError(f"{fmt.upper()} output not found after FFmpeg conversion.")
 
-    return staged_path, title, fmt
+    return staged_path, info, fmt
 
 
 @app.get("/")
@@ -225,30 +368,65 @@ def index():
 
 @app.get("/config")
 def config():
-    return jsonify(out_dir=short_path(OUT_DIR), out_dir_abs=OUT_DIR)
+    return jsonify(
+        out_dir=short_path(OUT_DIR),
+        out_dir_abs=OUT_DIR,
+        filename_template=FILENAME_TEMPLATE,
+    )
 
 
 @app.post("/config")
 def update_config():
-    global OUT_DIR
+    global OUT_DIR, FILENAME_TEMPLATE
     body = request.get_json(silent=True) or {}
-    new_dir = (body.get("out_dir") or "").strip()
-    if not new_dir:
-        return jsonify(error="Missing path."), 400
-    expanded = os.path.abspath(os.path.expanduser(new_dir))
-    try:
-        os.makedirs(expanded, exist_ok=True)
-    except OSError as e:
-        return jsonify(error=f"Could not create folder: {e}"), 400
-    if not os.path.isdir(expanded):
-        return jsonify(error="Not a folder."), 400
-    if not os.access(expanded, os.W_OK):
-        return jsonify(error="Folder is not writable."), 400
-    OUT_DIR = expanded
     cfg = load_user_config()
-    cfg["out_dir"] = expanded
-    save_user_config(cfg)
-    return jsonify(out_dir=short_path(OUT_DIR), out_dir_abs=OUT_DIR)
+    changed = False
+
+    if "out_dir" in body:
+        new_dir = (body.get("out_dir") or "").strip()
+        if not new_dir:
+            return jsonify(error="Missing path."), 400
+        expanded = os.path.abspath(os.path.expanduser(new_dir))
+        try:
+            os.makedirs(expanded, exist_ok=True)
+        except OSError as e:
+            return jsonify(error=f"Could not create folder: {e}"), 400
+        if not os.path.isdir(expanded):
+            return jsonify(error="Not a folder."), 400
+        if not os.access(expanded, os.W_OK):
+            return jsonify(error="Folder is not writable."), 400
+        OUT_DIR = expanded
+        cfg["out_dir"] = expanded
+        changed = True
+
+    if "filename_template" in body:
+        tpl = (body.get("filename_template") or "").strip() or DEFAULT_TEMPLATE
+        # Sanity: template must contain at least one substitutable token, otherwise
+        # every download collides into the same name + (n) suffix forever.
+        if not _TOKEN_RE.search(tpl):
+            return jsonify(error="Template must contain at least one {token}."), 400
+        FILENAME_TEMPLATE = tpl
+        cfg["filename_template"] = tpl
+        changed = True
+
+    if changed:
+        save_user_config(cfg)
+
+    return jsonify(
+        out_dir=short_path(OUT_DIR),
+        out_dir_abs=OUT_DIR,
+        filename_template=FILENAME_TEMPLATE,
+    )
+
+
+def _entry_summary(d: dict) -> dict:
+    return dict(
+        url=d.get("webpage_url") or d.get("url") or "",
+        title=d.get("title") or "audio",
+        channel=d.get("uploader") or d.get("channel") or "",
+        duration=fmt_duration(d.get("duration")),
+        thumbnail=d.get("thumbnail") or "",
+    )
 
 
 @app.post("/info")
@@ -257,6 +435,7 @@ def info():
 
     body = request.get_json(silent=True) or {}
     url = (body.get("url") or "").strip()
+    expand = bool(body.get("expand_playlist"))
     if not url:
         return jsonify(error="Missing URL."), 400
 
@@ -264,7 +443,8 @@ def info():
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "noplaylist": True,
+        "noplaylist": not expand,
+        "extract_flat": "in_playlist" if expand else False,
     }
     js_runtime = find_js_runtime()
     if js_runtime:
@@ -273,13 +453,18 @@ def info():
     try:
         with YoutubeDL(opts) as ydl:
             data = ydl.extract_info(url, download=False)
-        return jsonify(
-            title=data.get("title") or "audio",
-            channel=data.get("uploader") or data.get("channel") or "",
-            duration=fmt_duration(data.get("duration")),
-        )
     except Exception as e:
-        return jsonify(error=str(e)), 500
+        return jsonify(error=friendlyize_error(e)), 500
+
+    if expand and data.get("_type") == "playlist":
+        entries = [_entry_summary(e) for e in (data.get("entries") or []) if e]
+        return jsonify(
+            type="playlist",
+            title=data.get("title") or "playlist",
+            count=len(entries),
+            entries=entries,
+        )
+    return jsonify(_entry_summary(data))
 
 
 @app.post("/download")
@@ -300,12 +485,15 @@ def download():
             "final_path": None,
             "final_name": None,
             "error": None,
+            "cancel_event": threading.Event(),
         }
 
     def worker():
+        ev = _cancel_event_for(job_id)
+        cancelled = False
         try:
-            staged_path, title, final_fmt = run_yt_dlp(job_id, url, quality, fmt)
-            final_path = move_to_output(staged_path, title, final_fmt)
+            staged_path, info, final_fmt = run_yt_dlp(job_id, url, quality, fmt)
+            final_path = move_to_output(staged_path, info, final_fmt)
             update_job(
                 job_id,
                 status="done",
@@ -314,13 +502,36 @@ def download():
                 final_path=final_path,
                 final_name=os.path.basename(final_path),
             )
+        except JobCancelled:
+            cancelled = True
         except Exception as e:
-            update_job(job_id, status="error", phase="error", error=str(e))
+            # yt-dlp wraps hook exceptions in DownloadError, so a clean cancel may
+            # arrive here disguised. Trust the event over the exception type.
+            if ev and ev.is_set():
+                cancelled = True
+            else:
+                update_job(job_id, status="error", phase="error",
+                           error=friendlyize_error(e))
         finally:
+            if cancelled:
+                update_job(job_id, status="cancelled", phase="cancelled", error=None)
+                cleanup_staging_for_job(job_id)
             schedule_job_cleanup(job_id)
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify(job_id=job_id, out_dir=short_path(OUT_DIR))
+
+
+@app.post("/cancel/<job_id>")
+def cancel_job(job_id):
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify(error="Unknown job."), 404
+        ev = job.get("cancel_event")
+    if ev:
+        ev.set()
+    return ("", 204)
 
 
 @app.get("/progress/<job_id>")
