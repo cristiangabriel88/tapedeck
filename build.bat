@@ -11,6 +11,7 @@ if errorlevel 1 (
 pip install flask yt-dlp waitress || goto :err
 
 pyinstaller --onefile --noconsole --name tapedeck ^
+  --icon tapedeck.ico ^
   --add-data "static;static" ^
   --add-data "templates;templates" ^
   --collect-all yt_dlp ^

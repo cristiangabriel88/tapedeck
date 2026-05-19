@@ -11,6 +11,7 @@ fi
 pip install flask yt-dlp waitress
 
 pyinstaller --onefile --noconsole --name tapedeck \
+  --icon tapedeck.icns \
   --add-data "static:static" \
   --add-data "templates:templates" \
   --collect-all yt_dlp \
