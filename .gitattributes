@@ -1,0 +1,8 @@
+# Shell scripts must keep LF line endings — CRLF breaks bash on macOS/Linux
+# (e.g. "bad interpreter" errors, or carriage returns leaking into commands).
+*.sh        text eol=lf
+*.command   text eol=lf
+
+# Windows batch files: explicit CRLF so cmd.exe parses them reliably
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
