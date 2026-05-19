@@ -1929,9 +1929,6 @@ function App() {
         <div className="footer-accent" aria-hidden />
         <div className="footer-inner">
           <div className="footer-left">
-            <span className="footer-mark" aria-hidden>
-              <I.wave width="14" height="14" />
-            </span>
             <span className="footer-brand">
               tapedeck<span className="brand-dot">.</span>local
             </span>

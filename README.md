@@ -2,24 +2,54 @@
 
 A local web app that pulls audio from YouTube (and most yt-dlp sites) as MP3, M4A, Opus, WAV, or FLAC. Runs entirely on your machine — nothing leaves your computer.
 
-## Requirements
+## Get tapedeck
 
-- **Python 3.8+** — [python.org](https://python.org)
-- **FFmpeg** — must be available on your system
-  - Windows: `winget install ffmpeg`
-  - Mac: `brew install ffmpeg`
-  - Linux: `sudo apt install ffmpeg`
+Pick one of the options below. All paths need **FFmpeg** — see [Install FFmpeg](#install-ffmpeg) at the bottom of this section.
 
-## Quick Start (Windows)
+### Option 1 — Download the app (easiest, no Python needed)
 
-Double-click **`run.bat`**. It installs Python dependencies, starts the server, and opens the app at `http://127.0.0.1:5050`.
+1. Open the [Releases page](../../releases/latest).
+2. Download the file for your system:
+   - **Windows:** `tapedeck.exe`
+   - **macOS:** `tapedeck`
+3. Double-click it. Your browser opens at `http://127.0.0.1:5050`.
 
-## Manual Start
+> **macOS first launch:** right-click `tapedeck` → **Open** → **Open**. One-time Gatekeeper bypass.
+
+### Option 2 — Download the source ZIP
+
+For when you'd rather use the launcher scripts. You'll need Python installed.
+
+1. At the top of this repo, click the green **Code** button → **Download ZIP**.
+2. Unzip it anywhere (e.g. your Desktop).
+3. Launch the app:
+   - **Windows:** double-click **`run.bat`**.
+   - **macOS:** first time only, open Terminal, type `chmod +x ` (with a trailing space) and drag `run.command` into the Terminal window, then press Enter. After that, double-click **`run.command`** in Finder.
+4. Wait for it to install dependencies. Your browser opens at `http://127.0.0.1:5050`.
+
+> Needs **Python 3.8+** from [python.org](https://python.org). On Windows, tick **"Add Python to PATH"** during install.
+
+### Option 3 — From source (developers)
 
 ```bash
 pip install flask yt-dlp waitress
 python app.py
 # then open http://127.0.0.1:5050
+```
+
+## Install FFmpeg
+
+Required for all three options. Pick the line for your OS:
+
+```bash
+# Windows
+winget install ffmpeg
+
+# macOS  (Homebrew: https://brew.sh)
+brew install ffmpeg
+
+# Linux
+sudo apt install ffmpeg
 ```
 
 ## Usage
@@ -67,11 +97,13 @@ For non-Python users, package the app as a single executable. **FFmpeg stays ext
 # Windows
 build.bat
 
-# Mac/Linux
+# Mac/Linux  (first time: chmod +x build.sh)
 ./build.sh
 ```
 
 Output: `dist/tapedeck.exe` (Windows) or `dist/tapedeck` (Unix). Double-click to run.
+
+These binaries are what get uploaded to the [Releases page](../../releases/latest) for **Option 1** above.
 
 ## Features
 
