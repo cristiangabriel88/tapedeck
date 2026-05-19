@@ -3,10 +3,12 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
 import uuid
+import webbrowser
 
 from flask import Flask, jsonify, render_template, request
 
@@ -568,12 +570,44 @@ def reveal_folder():
     return ("", 204)
 
 
+HOST = "127.0.0.1"
+PORT = 5050
+URL = f"http://{HOST}:{PORT}"
+
+
+def _instance_already_running():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.25)
+        try:
+            s.connect((HOST, PORT))
+            return True
+        except OSError:
+            return False
+
+
+def _open_browser_when_ready():
+    deadline = threading.Event()
+    for _ in range(40):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.1)
+            try:
+                s.connect((HOST, PORT))
+                webbrowser.open(URL)
+                return
+            except OSError:
+                deadline.wait(0.1)
+
+
 if __name__ == "__main__":
+    if _instance_already_running():
+        webbrowser.open(URL)
+        sys.exit(0)
     sweep_staging()
+    threading.Thread(target=_open_browser_when_ready, daemon=True).start()
     try:
         from waitress import serve
         print(f" * Saving audio to {OUT_DIR}")
-        print(" * Running on http://127.0.0.1:5050 (Press CTRL+C to quit)")
-        serve(app, host="127.0.0.1", port=5050, threads=4)
+        print(f" * Running on {URL} (Press CTRL+C to quit)")
+        serve(app, host=HOST, port=PORT, threads=4)
     except ImportError:
-        app.run(host="127.0.0.1", port=5050, debug=False)
+        app.run(host=HOST, port=PORT, debug=False)
