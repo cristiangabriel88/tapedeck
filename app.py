@@ -1,4 +1,5 @@
 import ctypes
+import json
 import os
 import re
 import shutil
@@ -11,7 +12,41 @@ from flask import Flask, jsonify, render_template, request
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOADS_DIR = os.path.join(APP_DIR, "downloads")
-OUT_DIR = os.environ.get("TAPEDECK_OUT_DIR") or os.path.expanduser("~/Music/yt")
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+
+
+def load_user_config():
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_user_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass
+
+
+def initial_out_dir():
+    saved = (load_user_config().get("out_dir") or "").strip()
+    if saved:
+        path = os.path.expanduser(saved)
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError:
+            pass
+    env = os.environ.get("TAPEDECK_OUT_DIR")
+    if env:
+        return os.path.expanduser(env)
+    return os.path.expanduser("~/Music/yt")
+
+
+OUT_DIR = initial_out_dir()
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -190,7 +225,30 @@ def index():
 
 @app.get("/config")
 def config():
-    return jsonify(out_dir=short_path(OUT_DIR))
+    return jsonify(out_dir=short_path(OUT_DIR), out_dir_abs=OUT_DIR)
+
+
+@app.post("/config")
+def update_config():
+    global OUT_DIR
+    body = request.get_json(silent=True) or {}
+    new_dir = (body.get("out_dir") or "").strip()
+    if not new_dir:
+        return jsonify(error="Missing path."), 400
+    expanded = os.path.abspath(os.path.expanduser(new_dir))
+    try:
+        os.makedirs(expanded, exist_ok=True)
+    except OSError as e:
+        return jsonify(error=f"Could not create folder: {e}"), 400
+    if not os.path.isdir(expanded):
+        return jsonify(error="Not a folder."), 400
+    if not os.access(expanded, os.W_OK):
+        return jsonify(error="Folder is not writable."), 400
+    OUT_DIR = expanded
+    cfg = load_user_config()
+    cfg["out_dir"] = expanded
+    save_user_config(cfg)
+    return jsonify(out_dir=short_path(OUT_DIR), out_dir_abs=OUT_DIR)
 
 
 @app.post("/info")
